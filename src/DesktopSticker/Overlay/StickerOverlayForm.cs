@@ -171,21 +171,11 @@ public sealed class StickerOverlayForm : Form
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern IntPtr FindWindowW(string? lpClassName, string? lpWindowName);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern IntPtr FindWindowExW(IntPtr hParent, IntPtr hChildAfter, string? lpClassName, string? lpWindowName);
-
     [DllImport("user32.dll", ExactSpelling = true)]
     private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
 
-    [DllImport("user32.dll", ExactSpelling = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool IsWindowVisible(IntPtr hWnd);
-
-    [DllImport("user32.dll", ExactSpelling = true)]
-    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int GetClassNameW(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
     [DllImport("dwmapi.dll", ExactSpelling = true)]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
@@ -227,7 +217,7 @@ public sealed class StickerOverlayForm : Form
 
         _zOrderTimer = new System.Windows.Forms.Timer
         {
-            Interval = 350
+            Interval = 500
         };
         _zOrderTimer.Tick += (_, _) => AnchorToDesktopLayer();
 
@@ -604,7 +594,7 @@ public sealed class StickerOverlayForm : Form
 
     /// <summary>
     /// Hält das Sticker-Overlay zuverlässig unmittelbar vor der Desktop-/Wallpaper-Engine-Schicht (Progman / WorkerW)
-    /// und hinter sämtlichen normalen Programmfenstern – auch über Windows-11-ZBID-Schichten und Win+D hinweg.
+    /// und hinter sämtlichen normalen Programmfenstern – ohne Flackern oder Z-Order-Kämpfe mit Vollbild- oder überlappenden Fenstern.
     /// </summary>
     private void AnchorToDesktopLayer()
     {
@@ -616,45 +606,30 @@ public sealed class StickerOverlayForm : Form
         _inZOrderUpdate = true;
         try
         {
-            IntPtr frontmostDesktop = FindFrontmostDesktopWindow();
-            if (frontmostDesktop != IntPtr.Zero)
+            // GW_HWNDNEXT liefert das Fenster direkt unter uns in der Z-Order (Richtung Desktop-Hintergrund).
+            IntPtr nextUnderneath = GetWindow(Handle, GW_HWNDNEXT);
+
+            // GW_HWNDPREV liefert das Fenster direkt über uns in der Z-Order (Richtung Vordergrund).
+            IntPtr prevAbove = GetWindow(Handle, GW_HWNDPREV);
+
+            // Wenn das Fenster unter uns bereits der Desktop (Progman / WorkerW) oder das Ende der Z-Order-Kette ist,
+            // UND über uns kein Desktop-Fenster liegt (z. B. nach Win+D / Explorer-Umschaltung),
+            // befinden wir uns bereits exakt an der richtigen Stelle: hinter allen normalen Apps und vor dem Desktop.
+            bool isDirectlyAboveDesktop = (nextUnderneath == IntPtr.Zero || IsDesktopWindow(nextUnderneath)) &&
+                                          (prevAbove == IntPtr.Zero || !IsDesktopWindow(prevAbove));
+
+            if (isDirectlyAboveDesktop)
             {
-                IntPtr cur = frontmostDesktop;
-                for (int step = 0; step < 512; step++)
-                {
-                    IntPtr prev = GetWindow(cur, GW_HWNDPREV);
-                    if (prev == IntPtr.Zero)
-                    {
-                        return;
-                    }
-
-                    if (prev == Handle)
-                    {
-                        // Bereits exakt unmittelbar über dem Desktop-Layer positioniert
-                        return;
-                    }
-
-                    _ = SetWindowPos(
-                        Handle,
-                        prev,
-                        0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
-
-                    // Prüfen, ob Windows die Platzierung direkt hinter 'prev' im selben Z-Order-Band akzeptiert hat
-                    if (GetWindow(prev, GW_HWNDNEXT) == Handle)
-                    {
-                        return;
-                    }
-
-                    cur = prev;
-                }
+                return;
             }
 
+            // Nur falls nötig: Sanft an den Boden der normalen Fensterschicht setzen.
+            // WICHTIG: KEIN SWP_SHOWWINDOW übergeben, da dies DWM-Neuzeichnung und Flackern erzwingt!
             _ = SetWindowPos(
                 Handle,
                 HWND_BOTTOM,
                 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_SHOWWINDOW);
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
         }
         finally
         {
@@ -662,72 +637,23 @@ public sealed class StickerOverlayForm : Form
         }
     }
 
-    private static IntPtr FindFrontmostDesktopWindow()
+    private static bool IsDesktopWindow(IntPtr hWnd)
     {
-        IntPtr progman = FindWindowW("Progman", null);
-        uint progmanPid = 0;
-        if (progman != IntPtr.Zero)
+        if (hWnd == IntPtr.Zero)
         {
-            _ = GetWindowThreadProcessId(progman, out progmanPid);
+            return false;
         }
 
-        var desktopCandidates = new HashSet<IntPtr>();
-        if (progman != IntPtr.Zero)
+        var sb = new StringBuilder(64);
+        int len = GetClassNameW(hWnd, sb, sb.Capacity);
+        if (len <= 0)
         {
-            desktopCandidates.Add(progman);
+            return false;
         }
 
-        IntPtr shellHost = IntPtr.Zero;
-        if (progman != IntPtr.Zero && FindWindowExW(progman, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero)
-        {
-            shellHost = progman;
-        }
-
-        IntPtr workerW = FindWindowExW(IntPtr.Zero, IntPtr.Zero, "WorkerW", null);
-        int guard = 0;
-        while (workerW != IntPtr.Zero && guard++ < 128)
-        {
-            if (IsWindowVisible(workerW))
-            {
-                bool hasDefView = FindWindowExW(workerW, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero;
-                if (hasDefView)
-                {
-                    shellHost = workerW;
-                    desktopCandidates.Add(workerW);
-                }
-                else if (progmanPid != 0)
-                {
-                    _ = GetWindowThreadProcessId(workerW, out uint wPid);
-                    if (wPid == progmanPid)
-                    {
-                        desktopCandidates.Add(workerW);
-                    }
-                }
-            }
-
-            workerW = FindWindowExW(IntPtr.Zero, workerW, "WorkerW", null);
-        }
-
-        IntPtr frontmost = shellHost != IntPtr.Zero ? shellHost : progman;
-        if (frontmost == IntPtr.Zero)
-        {
-            return IntPtr.Zero;
-        }
-
-        // Vom Desktop-Fenster aus in Richtung Vordergrund (GW_HWNDPREV) laufen:
-        // Falls ein weiteres sichtbares Desktop-/WorkerW-Fenster davor liegt, dieses als vorderste Desktop-Schicht merken.
-        IntPtr scan = GetWindow(frontmost, GW_HWNDPREV);
-        int steps = 0;
-        while (scan != IntPtr.Zero && steps++ < 512)
-        {
-            if (desktopCandidates.Contains(scan))
-            {
-                frontmost = scan;
-            }
-            scan = GetWindow(scan, GW_HWNDPREV);
-        }
-
-        return frontmost;
+        string className = sb.ToString();
+        return string.Equals(className, "Progman", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(className, "WorkerW", StringComparison.OrdinalIgnoreCase);
     }
 
     protected override void WndProc(ref Message m)

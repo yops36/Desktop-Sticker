@@ -1,4 +1,4 @@
-# Desktop Sticker (Version 1.1.0)
+# Desktop Sticker (Version 1.1.1)
 
 **Desktop Sticker** ist ein kleines, lokales Windows-Werkzeug, mit dem Sie statische Bilder (**PNG, JPG, JPEG**) sowie **statische und animierte GIFs** frei auf Ihrem Desktop platzieren können – direkt über dem Hintergrundbild, unterhalb der Desktop-Symbole.
 

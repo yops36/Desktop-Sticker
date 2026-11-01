@@ -5,7 +5,7 @@
 ; ============================================================================
 
 #ifndef AppVersion
-  #define AppVersion "1.1.0"
+  #define AppVersion "1.1.1"
 #endif
 #ifndef PublishDir
   #define PublishDir "obj\publish"
